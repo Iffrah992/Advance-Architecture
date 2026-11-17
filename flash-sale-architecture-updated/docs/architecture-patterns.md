@@ -58,23 +58,6 @@ Easy for one buyer; at 10,000 in the same second, the bottlenecks from SRS Appen
 
 Components are organised into horizontal layers, each with one role: **presentation**, **business**, **persistence**, **database**. It is the usual default for Spring Boot applications, which makes it the project's **baseline** (ADR-0003).
 
-```mermaid
-flowchart TB
-    subgraph Presentation
-        C[PurchaseController]
-    end
-    subgraph Business
-        S[PurchaseService]
-    end
-    subgraph Persistence
-        R[InventoryRepository / OrderRepository]
-    end
-    subgraph Database
-        DB[(PostgreSQL)]
-    end
-    C --> S --> R --> DB
-```
-
 ### Key Concepts
 
 - **Separation of concerns** — the controller does not write SQL; the repository does not decide who wins.
@@ -86,27 +69,12 @@ flowchart TB
 
 **Step 0 — baseline.** All five steps in one transaction:
 
-```java
-@Transactional
-public Order buy(long saleId, long userId) {
-    Inventory inv = inventoryRepo.findById(saleId);          // check
-    if (inv.getAvailable() <= 0) throw new SoldOutException();
-    inv.setAvailable(inv.getAvailable() - 1);                 // claim — separate step (B2)
-    Order order = orderRepo.save(new Order(saleId, userId));
-    paymentClient.charge(order);                              // slow call, connection held (B3, B4)
-    order.confirm();
-    return order;
-}
-```
 
 Running T-1 to T-3 on this version is expected to show lock waits on the stock row (B1), overselling (B2), and pool exhaustion while waiting for payment (B3, B4). The baseline records FR-15–FR-18 metrics so every later step can be compared.
 
 **Step 1 — atomic claim (B2).** *Reason:* check and claim must be one indivisible operation.
 
-```sql
-UPDATE inventory SET available = available - 1
-WHERE sale_id = :saleId AND available > 0;   -- 1 row → reserved, 0 rows → sold out
-```
+
 
 → [ADR-0006](../adr/claim-stock-atomically.md)
 
@@ -145,13 +113,6 @@ Decoupled, single-purpose event processors receive and process events asynchrono
 
 A central **event mediator** receives the initial event and orchestrates each step by sending events to channels that processors consume.
 
-```mermaid
-flowchart LR
-    Q[Event queue] --> M[Checkout mediator]
-    M --> C1[Inventory channel] --> P1[Inventory processor]
-    M --> C2[Order channel] --> P2[Order processor]
-    M --> C3[Payment channel] --> P3[Payment processor]
-```
 
 **For the flash sale:** every purchase would pass through the mediator — a new central bottleneck and single point of failure. The flow is short and linear, so orchestration is not needed. **Not chosen.**
 
@@ -159,16 +120,6 @@ flowchart LR
 
 No central mediator. Each processor does its step and publishes a new event through a lightweight broker.
 
-```mermaid
-flowchart LR
-    I[Inventory] -- StockReserved --> O[Order]
-    O -- OrderCreated --> P[Payment]
-    P -- PaymentSucceeded --> O
-    P -- PaymentFailed --> O
-    O -- OrderFailed --> I
-    X[Expiry] -- ReservationExpired --> I
-    I -- StockReleased --> G[Gate]
-```
 
 **Step 4 — short transaction, then async payment (B3, B4).**
 
@@ -230,29 +181,11 @@ sequenceDiagram
 
 A **core system** with minimal, stable functionality plus independent **plug-in modules** connected through a contract and a registry. For the flash sale the core would be ticketing, claim and reservation lifecycle; plug-ins would be allocation policies, per-user rules and payment adapters.
 
-```mermaid
-flowchart TB
-    subgraph Core["Core sale engine"]
-        T[Ticketing]
-        A[Atomic claim]
-        L[Reservation lifecycle]
-        REG[Plug-in registry]
-    end
-    REG --- F[FIFO policy]
-    REG --- R[Randomized queue policy]
-    REG --- LO[Lottery policy]
-    REG --- PA[Payment adapter]
-```
 
 ### Pattern Examples
 
 A pluggable allocation contract:
 
-```java
-public interface AllocationPolicy {
-    List<Ticket> selectWinners(List<Ticket> entrants, int stock);
-}
-```
 
 FIFO would sort by ticket number; a lottery policy would shuffle entries collected during a short window, which removes any advantage from network speed.
 
@@ -381,15 +314,7 @@ flowchart TB
 2. **Route.** Each admitted request goes to any processing unit; none needs a database connection to claim stock.
 3. **Atomic claim in memory.** Check limit + check stock + decrement + record buyer as one operation (ADR-0006). Example with the proposed technology (Redis Lua, ADR-0013):
 
-   ```lua
-   -- KEYS[1]=stock:{sale}  KEYS[2]=buyers:{sale}  ARGV[1]=userId
-   if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -2 end
-   local s = tonumber(redis.call('GET', KEYS[1]))
-   if s <= 0 then return -1 end
-   redis.call('DECR', KEYS[1])
-   redis.call('SADD', KEYS[2], ARGV[1])
-   return s - 1
-   ```
+
 
    *Reason:* an in-memory atomic operation avoids row locks and the DB connection pool.
 4. **Asynchronous persistence.** Successful claims produce events; reservations and orders are written to PostgreSQL by consumers. PostgreSQL stays the system of record.
